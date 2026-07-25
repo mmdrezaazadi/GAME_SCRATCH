@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# packaging output — the exe is published as a GitHub Release asset,
+# not committed to the tree
+build/*
+!build/.gitkeep
+
+# generated bundle (rebuild with `npm run build:bundle`)
+public/bundle.js
+public/bundle.js.map
+
+# staged asset copy (public/assets is a symlink in dev, a real copy at package
+# time — the source of truth is ./assets)
+public/assets/
+
+# electron-builder scratch
+dist/
+.cache/
+*.log
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
