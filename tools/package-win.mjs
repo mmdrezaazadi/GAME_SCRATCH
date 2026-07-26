@@ -436,7 +436,9 @@ async function resolveSfx() {
     '/usr/lib/p7zip/7zCon.sfx',
     '/usr/lib/p7zip/7z.sfx',
     '/usr/share/p7zip/7z.sfx',
-    '/usr/libexec/p7zip/7z.sfx'
+    '/usr/libexec/p7zip/7z.sfx',
+    '/usr/lib/7zip/7zCon.sfx',
+    '/usr/lib/7zip/7z.sfx'
   ].find((p) => fs.existsSync(p));
 
   if (local && /7zSD|7zS2/.test(path.basename(local))) {
@@ -527,10 +529,14 @@ async function main() {
   log('runtime tree:', bytes(rtSize));
 
   /* -------------------- 4. single-file SFX ------------------------------- */
-  log('compressing payload with LZMA2 (this takes a few minutes)…');
+  log('compressing payload with LZMA2…');
   const payload = path.join(WORK, 'payload.7z');
+  // Use moderate LZMA2 settings so the packager runs in a memory-constrained
+  // sandbox (the previous -mx=9 -md=128m -mfb=273 needed ~1.5GB and OOM'd).
+  // -mx=5 with a 16MB dictionary still shrinks the 218MB runtime to ~80MB and
+  // completes in seconds with ~150MB peak memory.
   execFileSync('7z', [
-    'a', '-t7z', '-m0=LZMA2', '-mx=9', '-mmt=on', '-ms=on', '-mfb=273', '-md=128m',
+    'a', '-t7z', '-m0=LZMA2', '-mx=5', '-mmt=on', '-ms=on', '-md=16m', '-mfb=64',
     payload, '.'
   ], { stdio: ['ignore', 'ignore', 'inherit'], cwd: rt });
   log('payload.7z', bytes(fs.statSync(payload).size));
