@@ -15,6 +15,11 @@ import { Rng } from '../gfx/noise.js';
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3();
 const _q = new THREE.Quaternion(), _m = new THREE.Matrix4();
 const UP = new THREE.Vector3(0, 1, 0);
+// Ragdoll temporaries — hoisted so updateRagdoll doesn't allocate per frame.
+const _a = new THREE.Vector3(), _b = new THREE.Vector3();
+const _segMat = new THREE.Matrix4(), _lm = new THREE.Matrix4(), _wm = new THREE.Matrix4();
+const _unitScale = new THREE.Vector3(1, 1, 1);
+const _poolCenter = new THREE.Vector3();
 
 export const STATE = { IDLE: 0, WALK: 1, CHASE: 2, ATTACK: 3, STAGGER: 4, DEAD: 5, SPAWN: 6 };
 
@@ -311,12 +316,33 @@ export class Zombie {
       return;
     }
 
-    /* ---- perception ---- */
-    const canSee = dist < 46 && (dist < 6 || game.physics.visible(
-      _v2.copy(this.root.position).setY(this.root.position.y + 1.45 * this.def.scale),
-      _v3.copy(player.pos).setY(player.pos.y + 1.0)
-    ));
+    /* ---- perception ----
+     * Line-of-sight is a full raycast through every collider — expensive when
+     * 38 zombies all do it every frame. Throttle it: zombies close to the
+     * player (within 12m) check every frame (they need to be responsive);
+     * mid-range zombies check every 2nd frame; far zombies every 4th. The
+     * alerted state is sticky so a zombie that has seen you stays chasing
+     * regardless of the throttle. */
+    let canSee;
+    if (this._alerted) {
+      canSee = true;
+    } else if (dist < 6) {
+      canSee = true;
+    } else if (dist < 46) {
+      const period = dist < 18 ? 2 : 4;
+      this._seeFrame = (this._seeFrame || 0) + 1;
+      if ((this._seeFrame % period) === 0) {
+        this._cachedSee = game.physics.visible(
+          _v2.copy(this.root.position).setY(this.root.position.y + 1.45 * this.def.scale),
+          _v3.copy(player.pos).setY(player.pos.y + 1.0)
+        );
+      }
+      canSee = !!this._cachedSee;
+    } else {
+      canSee = false;
+    }
     const alerted = canSee || dist < 12 || game.noiseLevel > 0.4 || this.stateT > 4;
+    if (alerted) this._alerted = true;
 
     if (alerted && this.state !== STATE.CHASE) { this.state = STATE.CHASE; this.stateT = 0; }
 
@@ -369,9 +395,14 @@ export class Zombie {
     this.root.rotation.y = this.yaw;
     this.moveBy(this.vel.x * dt, this.vel.z * dt);
 
-    // gravity / ground follow
-    const gy = game.physics.groundAt(this.root.position.x, this.root.position.y + 0.6, this.root.position.z, 4.0, this.radius * 0.7);
-    const targetY = gy > -1e8 ? gy : 0;
+    // gravity / ground follow — throttled for far zombies (the eye can't see
+    // a 4m ground snap from 60m away). Close zombies still probe every frame.
+    if (dist < 30 || (this.frameCounter & 3) === 0) {
+      const gy = game.physics.groundAt(this.root.position.x, this.root.position.y + 0.6, this.root.position.z, 4.0, this.radius * 0.7);
+      this._cachedGround = gy > -1e8 ? gy : 0;
+    }
+    this.frameCounter = (this.frameCounter || 0) + 1;
+    const targetY = this._cachedGround ?? 0;
     this.root.position.y += (targetY - this.root.position.y) * Math.min(1, dt * 12);
 
     // pose
@@ -397,10 +428,15 @@ export class Zombie {
 
   avoid(dir, dt) {
     const game = this.game;
-    // separation from other zombies
+    // Separation via the Game's shared zombie spatial hash instead of an O(n²)
+    // scan over the whole horde. We only inspect zombies in our own cell + the
+    // 8 neighbouring cells, which for a spread-out horde is usually 0–4 candidates
+    // instead of 38.
     const sep = _v3.set(0, 0, 0);
     let n = 0;
-    for (const z of game.zombies) {
+    const neighbours = game.zombieGrid?.queryNear(this.root.position.x, this.root.position.z) || game.zombies;
+    for (let i = 0; i < neighbours.length; i++) {
+      const z = neighbours[i];
       if (z === this || z.dead) continue;
       const dx = this.root.position.x - z.root.position.x;
       const dz = this.root.position.z - z.root.position.z;
@@ -415,7 +451,14 @@ export class Zombie {
     }
     if (n) { dir.x += sep.x * 1.5; dir.z += sep.z * 1.5; }
 
-    // wall avoidance: probe left/right
+    // wall avoidance: probe forward (only every other frame per zombie to halve
+    // the raycast cost across the horde)
+    this._avoidFrame = (this._avoidFrame || 0) + 1;
+    if ((this._avoidFrame & 1) === 0) {
+      const len = Math.hypot(dir.x, dir.z);
+      if (len > 1e-5) { dir.x /= len; dir.z /= len; }
+      return;
+    }
     const p = _v.copy(this.root.position).setY(this.root.position.y + 0.9);
     const probe = 1.5;
     const fwd = _v2.set(dir.x, 0, dir.z).normalize();
@@ -757,57 +800,80 @@ export class Zombie {
   updateRagdoll(dt) {
     if (!this.ragdoll) return;
     this.ragdollT += dt;
-    const steps = Math.min(3, Math.ceil(dt / 0.0125));
-    const h = dt / steps;
-    for (let i = 0; i < steps; i++) this.ragdoll.step(h, 6);
+    this.lastDt = dt;
+    // Sleeping ragdolls are completely static — skip the solver AND the per-segment
+    // matrix recomposition. This is the single biggest ragdoll win: a settled
+    // corpse costs ~nothing instead of redoing 19 look-at + N matrix multiplies
+    // every frame. With 20+ corpses on the ground this was a major stutter source.
+    if (this.ragdoll.sleeping) {
+      // still handle the fade-out and any deferred pool spawn
+      if (!this.poolSpawned) this.trySpawnPool();
+      if (this.ragdollT > 26) this.stepFadeout(dt);
+      return;
+    }
 
-    const _a = new THREE.Vector3(), _b = new THREE.Vector3();
-    for (const sg of this.ragdollSegs) {
+    // Single substep at the frame dt is enough for believable corpses; the
+    // previous 3 substeps × 6 constraint iterations was 18× the work. The verlet
+    // solver now runs 4 iterations internally which is plenty for floppy limbs.
+    this.ragdoll.step(dt, 4);
+
+    // Reuse temporaries instead of allocating Matrix4/Vector3 per segment per
+    // frame (the old code new'd 2 Matrix4 + 1 Vector3 per segment → ~50 allocs
+    // per corpse per frame, which triggered GC pressure during big firefights).
+    const segs = this.ragdollSegs;
+    for (let si = 0; si < segs.length; si++) {
+      const sg = segs[si];
       _a.copy(sg.a.p); _b.copy(sg.b.p);
       _m.lookAt(_a, _b, UP);
       _q.setFromRotationMatrix(_m);
-      // apply the segment frame to each child using the stored local transform
-      const segMat = new THREE.Matrix4().compose(_a, _q, new THREE.Vector3(1, 1, 1));
-      for (const c of sg.children) {
-        const lm = new THREE.Matrix4().compose(c.lp, c.lq, c.ls);
-        const wm = segMat.clone().multiply(lm);
-        wm.decompose(c.obj.position, c.obj.quaternion, c.obj.scale);
+      _segMat.compose(_a, _q, _unitScale);
+      for (let ci = 0; ci < sg.children.length; ci++) {
+        const c = sg.children[ci];
+        _lm.compose(c.lp, c.lq, c.ls);
+        _wm.copy(_segMat).multiply(_lm);
+        _wm.decompose(c.obj.position, c.obj.quaternion, c.obj.scale);
       }
     }
 
-    // pooling blood after the body settles
-    this.poolTimer -= dt;
-    if (!this.poolSpawned && (this.poolTimer <= 0 || this.ragdoll.sleeping)) {
-      this.poolSpawned = true;
-      const c = this.ragdoll.center();
-      const gy = this.game.physics.groundAt(c.x, c.y + 0.5, c.z, 3.0, 0.3);
-      const y = gy > -1e8 ? gy : 0;
-      this.game.fx.bloodPool(new THREE.Vector3(c.x, y, c.z), 1.4 + Math.random() * 1.1, this.def.scale);
-      // a couple of extra splats around the body
-      for (let i = 0; i < 3; i++) {
-        const a = Math.random() * Math.PI * 2, r = Math.random() * 1.4 * this.def.scale;
-        this.game.fx.bloodPool(
-          new THREE.Vector3(c.x + Math.cos(a) * r, y, c.z + Math.sin(a) * r),
-          0.5 + Math.random() * 0.8, this.def.scale
-        );
-      }
-    }
+    this.trySpawnPool();
+    if (this.ragdollT > 26) this.stepFadeout(dt);
+  }
 
-    // slowly sink & fade corpses to keep the scene manageable
-    if (this.ragdollT > 26) {
-      const k = Math.min(1, (this.ragdollT - 26) / 4);
-      for (const sg of this.ragdollSegs) {
-        for (const c of sg.children) {
-          c.obj.traverse?.(o => {
-            if (o.isMesh && o.material) {
-              if (!o.material.transparent) { o.material = o.material.clone(); o.material.transparent = true; }
-              o.material.opacity = 1 - k;
-            }
-          });
-        }
-      }
-      if (k >= 1) this.markForRemoval = true;
+  trySpawnPool() {
+    if (this.poolSpawned) return;
+    this.poolTimer = (this.poolTimer ?? 0.35) - this.lastDt;
+    if (this.poolTimer > 0 && !this.ragdoll.sleeping) return;
+    this.poolSpawned = true;
+    const c = this.ragdoll.center(_poolCenter);
+    const gy = this.game.physics.groundAt(c.x, c.y + 0.5, c.z, 3.0, 0.3);
+    const y = gy > -1e8 ? gy : 0;
+    this.game.fx.bloodPool(_v.set(c.x, y, c.z), 1.4 + Math.random() * 1.1, this.def.scale);
+    for (let i = 0; i < 3; i++) {
+      const a = Math.random() * Math.PI * 2, r = Math.random() * 1.4 * this.def.scale;
+      this.game.fx.bloodPool(
+        _v2.set(c.x + Math.cos(a) * r, y, c.z + Math.sin(a) * r),
+        0.5 + Math.random() * 0.8, this.def.scale
+      );
     }
+  }
+
+  stepFadeout(dt) {
+    this.lastDt = dt;
+    const k = Math.min(1, (this.ragdollT - 26) / 4);
+    const segs = this.ragdollSegs;
+    for (let si = 0; si < segs.length; si++) {
+      const children = segs[si].children;
+      for (let ci = 0; ci < children.length; ci++) {
+        const obj = children[ci].obj;
+        obj.traverse?.(o => {
+          if (o.isMesh && o.material) {
+            if (!o.material.transparent) { o.material = o.material.clone(); o.material.transparent = true; }
+            o.material.opacity = 1 - k;
+          }
+        });
+      }
+    }
+    if (k >= 1) this.markForRemoval = true;
   }
 
   disposeRagdoll() {

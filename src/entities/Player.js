@@ -690,13 +690,34 @@ export class Player {
       const wHit = this.game.physics.raycast(from, dir, dist);
       const wDist = wHit ? wHit.t : dist;
 
-      // closest zombie zone hit within wDist
+      // Closest zombie zone hit within wDist. Use the shared spatial grid to
+      // limit the candidate set to zombies actually near the ray's origin
+      // (the per-zone bounding-sphere test is still the final arbiter). For a
+      // tight formation this is ~5 raycastZones calls instead of 38, which
+      // matters a lot for high-RPM weapons and shotgun pellets.
       let best = null, bestZ = null;
-      for (const z of this.game.zombies) {
+      const candidates = this.game.zombieGrid
+        ? this.game.zombieGrid.queryNear(from.x, from.z)
+        : this.game.zombies;
+      for (let i = 0; i < candidates.length; i++) {
+        const z = candidates[i];
         if (z.dead || hitZombies.has(z)) continue;
         if (z.root.position.distanceToSquared(from) > (dist + 3) * (dist + 3)) continue;
         const r = z.raycastZones(from, dir, Math.min(wDist, dist));
         if (r && (!best || r.dist < best.dist)) { best = r; bestZ = z; }
+      }
+      // Fallback: the grid cell of the ray origin may miss a zombie that is far
+      // along the ray but in a different cell. Only do the full scan if no hit
+      // was found in the near cells (keeps the common case fast).
+      if (!best) {
+        const all = this.game.zombies;
+        for (let i = 0; i < all.length; i++) {
+          const z = all[i];
+          if (z.dead || hitZombies.has(z)) continue;
+          if (z.root.position.distanceToSquared(from) > (dist + 3) * (dist + 3)) continue;
+          const r = z.raycastZones(from, dir, Math.min(wDist, dist));
+          if (r && (!best || r.dist < best.dist)) { best = r; bestZ = z; }
+        }
       }
 
       if (best && bestZ) {

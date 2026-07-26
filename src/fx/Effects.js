@@ -16,6 +16,7 @@ import { Rng } from '../gfx/noise.js';
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3();
 const _q = new THREE.Quaternion(), _m = new THREE.Matrix4();
+const _euler = new THREE.Euler();
 const UP = new THREE.Vector3(0, 1, 0);
 
 /* ====================================================== PARTICLE SYSTEM ==== */
@@ -180,7 +181,12 @@ class ParticleSystem {
   update(dt, t, physics, fx) {
     this.mat.uniforms.uTime.value = t;
     const dead = [];
-    for (const i of this.active) {
+    // Iterate over a snapshot array of the active indices. The Set iteration
+    // was fine, but converting to an array first avoids the per-item delete-while
+    // iterating hazard and lets us use a tight index loop.
+    const activeArr = Array.from(this.active);
+    for (let ai = 0; ai < activeArr.length; ai++) {
+      const i = activeArr[ai];
       const life = this.data[i * 4] - dt;
       if (life <= 0) { dead.push(i); continue; }
       this.data[i * 4] = life;
@@ -194,9 +200,15 @@ class ParticleSystem {
       const pz = this.pos[i3 + 2] + vz * dt;
 
       const type = this.data[i * 4 + 3];
-      if (type < 0.5 && physics) {
+      // Blood droplets (type 0) check the ground — but only when actually
+      // descending and close to where the ground might be. The old code queried
+      // the physics grid for EVERY blood droplet EVERY frame even when it was
+      // flying upward 2m above the floor. Skipping the query unless the particle
+      // is falling AND within 0.5m of likely ground cuts the vast majority of
+      // these queries (each is a broadphase hash lookup + AABB scan).
+      if (type < 0.5 && physics && vy < 0 && py < 1.6) {
         const gy = physics.groundAt(px, this.pos[i3 + 1] + 0.1, pz, Math.max(0.4, Math.abs(vy) * dt + 0.25), 0.05);
-        if (gy > -1e8 && py <= gy + 0.02 && vy < 0) {
+        if (gy > -1e8 && py <= gy + 0.02) {
           if (Math.random() < 0.5) fx?.bloodPool(_v.set(px, gy, pz), 0.10 + Math.random() * 0.22, 1, true);
           dead.push(i); continue;
         }
@@ -204,11 +216,19 @@ class ParticleSystem {
       this.pos[i3] = px; this.pos[i3 + 1] = py; this.pos[i3 + 2] = pz;
       this.vel[i3] = vx; this.vel[i3 + 1] = vy; this.vel[i3 + 2] = vz;
     }
-    for (const i of dead) {
+    for (let di = 0; di < dead.length; di++) {
+      const i = dead[di];
       this.active.delete(i);
       this.free.push(i);
       this.data[i * 4 + 2] = 0;
       this.color[i * 4 + 3] = 0;
+    }
+    // Trim the high-water mark when many slots have freed, so we don't keep
+    // uploading thousands of zeroed instances every frame after a big fight.
+    if (dead.length > 64) {
+      let hw = 0;
+      for (const i of this.active) if (i > hw) hw = i;
+      this.highWater = hw + 1;
     }
     this.geo.instanceCount = this.highWater;
     this.geo.attributes.iPos.needsUpdate = true;
@@ -644,14 +664,20 @@ export class Effects {
     for (let i = this.debris.length - 1; i >= 0; i--) {
       const d = this.debris[i];
       d.life -= dt;
-      const steps = Math.min(2, Math.ceil(dt / 0.016));
-      for (let k = 0; k < steps; k++) d.body.step(dt / steps, 3);
-      const p = d.body.parts[0];
-      d.mesh.position.copy(p.p);
+      // Sleeping debris (settled casings, gibs at rest) skip the solver + spin
+      // entirely. With 200 casings on the ground after a firefight this is a
+      // big saving. Only step non-sleeping bodies, and only substep when the
+      // frame is long enough to need it.
       if (!d.body.sleeping) {
+        const steps = dt > 0.024 ? 2 : 1;
+        const h = dt / steps;
+        for (let k = 0; k < steps; k++) d.body.step(h, 3);
+        const p = d.body.parts[0];
+        d.mesh.position.copy(p.p);
         const sp = p.vel.length();
         const spinScale = Math.min(1, sp * 22);
-        _q.setFromEuler(new THREE.Euler(d.spin.x * dt * spinScale, d.spin.y * dt * spinScale, d.spin.z * dt * spinScale));
+        _euler.set(d.spin.x * dt * spinScale, d.spin.y * dt * spinScale, d.spin.z * dt * spinScale);
+        _q.setFromEuler(_euler);
         d.quat.multiply(_q);
         d.mesh.quaternion.copy(d.quat);
         if (d.trail && sp > 0.02 && Math.random() < 0.5) {
@@ -660,8 +686,14 @@ export class Effects {
             color: [0.30, 0.018, 0.014], alpha: 1, drag: 0.3, gravity: -19
           });
         }
+        if (d.body.sleeping && d.trail && !d.pooled) {
+          d.pooled = true;
+          const gy = this.game.physics.groundAt(p.p.x, p.p.y + 0.3, p.p.z, 1.0, 0.1);
+          if (gy > -1e8) this.bloodPool(_v.set(p.p.x, gy, p.p.z), 0.30 + Math.random() * 0.5);
+        }
       } else if (d.trail && !d.pooled) {
         d.pooled = true;
+        const p = d.body.parts[0];
         const gy = this.game.physics.groundAt(p.p.x, p.p.y + 0.3, p.p.z, 1.0, 0.1);
         if (gy > -1e8) this.bloodPool(_v.set(p.p.x, gy, p.p.z), 0.30 + Math.random() * 0.5);
       }

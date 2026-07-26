@@ -12,7 +12,7 @@ const CUES = [
   'hitmark', 'hitmarkHead',
   'playerHurt', 'playerDie', 'heartbeat', 'heal', 'pickup', 'weaponPickup',
   'footDirt', 'footConcrete', 'footMetal', 'jump', 'land',
-  'uiClick', 'uiHover', 'uiBack', 'waveStart', 'waveEnd', 'lastStand',
+  'uiClick', 'uiHover', 'uiBack', 'waveStart', 'waveEnd', 'lastStand', 'radio',
   'impactConcrete', 'impactMetal', 'impactWood', 'impactDirt', 'impactGlass',
   'grenade', 'grenadePin', 'wind', 'ambience'
 ];
@@ -484,6 +484,21 @@ export class AudioEngine {
     B.waveStart = this._tone(1.35, [110, 165, 220], { decay: 1.6, type: 'saw', vib: 4 });
     B.waveEnd = this._tone(1.5, [147, 220, 294, 370], { decay: 1.3, type: 'sine' });
     B.lastStand = this._tone(2.4, [82, 98, 123], { decay: 0.9, type: 'saw', vib: 6 });
+    // Radio transmission blip — short staticky squelch that plays under each
+    // story line so the radio subtitle reads as a real incoming transmission.
+    B.radio = (() => {
+      const dur = 0.22, sr = this.ctx.sampleRate;
+      const buf = this.ctx.createBuffer(1, Math.ceil(sr * dur), sr);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) {
+        const t = i / d.length;
+        // opening squelch tone + trailing noise hiss
+        const sq = Math.sin(t * Math.PI * 2 * 1800) * Math.exp(-t * 22) * 0.5;
+        const nz = (Math.random() * 2 - 1) * (0.18 + 0.12 * (1 - t)) * Math.exp(-t * 9);
+        d[i] = (sq + nz) * 0.5;
+      }
+      return buf;
+    })();
 
     /* --- impacts --- */
     B.impactConcrete = this._impact(0.24, { decay: 66, lp: 0.55, hp: 0.06 });

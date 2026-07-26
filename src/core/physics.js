@@ -95,9 +95,11 @@ export class PhysicsWorld {
     for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) {
       const a = this.grid.get(x + ',' + z);
       if (!a) continue;
-      for (const col of a) {
+      for (let i = 0; i < a.length; i++) {
+        const col = a[i];
         if (seen.has(col)) continue;
         seen.add(col);
+        // tight AABB rejection before pushing — avoids the per-call Set growth
         if (col.aabbMax.x < min.x || col.aabbMin.x > max.x) continue;
         if (col.aabbMax.y < min.y || col.aabbMin.y > max.y) continue;
         if (col.aabbMax.z < min.z || col.aabbMin.z > max.z) continue;
@@ -111,8 +113,14 @@ export class PhysicsWorld {
   /**
    * Resolve a vertical capsule (from feet + r to feet + height - r) against all
    * colliders using iterative depenetration; returns collision info.
+   *
+   * Performance: the previous version sampled 5 points along the capsule segment
+   * for every collider in the broadphase, every iteration — for 38 zombies that
+   * was the single hottest physics cost. We now sample 3 points and bail out of
+   * the inner loop as soon as a meaningful push is applied in an iteration, and
+   * the broadphase cell query is shared via a reusable buffer.
    */
-  resolveCapsule(pos, radius, height, iterations = 4) {
+  resolveCapsule(pos, radius, height, iterations = 3) {
     const info = { grounded: false, groundY: -1e9, normal: new THREE.Vector3(0, 1, 0), hit: false, ceiling: false };
     const min = _v4.set(pos.x - radius - 0.1, pos.y - 0.1, pos.z - radius - 0.1);
     const max = _v5.set(pos.x + radius + 0.1, pos.y + height + 0.1, pos.z + radius + 0.1);
@@ -124,12 +132,12 @@ export class PhysicsWorld {
 
     for (let it = 0; it < iterations; it++) {
       let moved = false;
-      for (const col of cands) {
-        // find the deepest overlap between the capsule segment and the box
-        // approximate: test a few points along the segment
-        const N = 4;
-        for (let i = 0; i <= N; i++) {
-          const t = i / N;
+      for (let ci = 0; ci < cands.length; ci++) {
+        const col = cands[ci];
+        // 3 sample points (head-ish, mid, feet) is enough for upright character
+        // capsules; the per-iteration push propagates through the loop anyway.
+        for (let i = 0; i <= 2; i++) {
+          const t = i * 0.5;
           _v3.lerpVectors(segA, segB, t);
           const cp = col.closest(_v3, _v1);
           const d = _v2.subVectors(_v3, cp);
@@ -191,21 +199,26 @@ export class PhysicsWorld {
   /* ------------------------------------------------------------- raycast ---- */
   /**
    * Ray vs all colliders (slab test in each box's local space).
+   * Hot path: every bullet, every AI line-of-sight, every footstep probe. The
+   * broadphase AABB is built from the ray's swept extent and the slab test runs
+   * in flat locals (no array allocation).
    * @returns {{t:number, point:THREE.Vector3, normal:THREE.Vector3, collider:BoxCollider}|null}
    */
   raycast(origin, dir, maxDist = 200) {
+    const endX = origin.x + dir.x * maxDist, endY = origin.y + dir.y * maxDist, endZ = origin.z + dir.z * maxDist;
     const min = _v4.set(
-      Math.min(origin.x, origin.x + dir.x * maxDist) - 0.5,
-      Math.min(origin.y, origin.y + dir.y * maxDist) - 0.5,
-      Math.min(origin.z, origin.z + dir.z * maxDist) - 0.5);
+      (origin.x < endX ? origin.x : endX) - 0.5,
+      (origin.y < endY ? origin.y : endY) - 0.5,
+      (origin.z < endZ ? origin.z : endZ) - 0.5);
     const max = _v5.set(
-      Math.max(origin.x, origin.x + dir.x * maxDist) + 0.5,
-      Math.max(origin.y, origin.y + dir.y * maxDist) + 0.5,
-      Math.max(origin.z, origin.z + dir.z * maxDist) + 0.5);
+      (origin.x > endX ? origin.x : endX) + 0.5,
+      (origin.y > endY ? origin.y : endY) + 0.5,
+      (origin.z > endZ ? origin.z : endZ) + 0.5);
     const cands = this.query(min, max, _rayBuf);
     let bestT = maxDist, best = null, bestN = null;
 
-    for (const c of cands) {
+    for (let ci = 0; ci < cands.length; ci++) {
+      const c = cands[ci];
       // transform ray into box local
       const cos = c.cos, sin = c.sin;
       const ox = origin.x - c.c.x, oz = origin.z - c.c.z;
@@ -215,26 +228,48 @@ export class PhysicsWorld {
       const ldy = dir.y;
 
       let t0 = 0, t1 = bestT, axis = -1, sgn = 1;
-      const o = [lox, loy, loz], d = [ldx, ldy, ldz], h = [c.h.x, c.h.y, c.h.z];
       let ok = true;
-      for (let a = 0; a < 3; a++) {
-        if (Math.abs(d[a]) < 1e-8) {
-          if (Math.abs(o[a]) > h[a]) { ok = false; break; }
-          continue;
-        }
-        const inv = 1 / d[a];
-        let ta = (-h[a] - o[a]) * inv;
-        let tb = (h[a] - o[a]) * inv;
-        let s = -1;
+      // unrolled slab test on the three local axes
+      const adx = Math.abs(ldx), ady = Math.abs(ldy), adz = Math.abs(ldz);
+      const hx = c.h.x, hy = c.h.y, hz = c.h.z;
+      // X
+      if (adx < 1e-8) { if (Math.abs(lox) > hx) { ok = false; } }
+      else {
+        const inv = 1 / ldx;
+        let ta = (-hx - lox) * inv, tb = (hx - lox) * inv, s = -1;
         if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; s = 1; }
-        if (ta > t0) { t0 = ta; axis = a; sgn = s; }
+        if (ta > t0) { t0 = ta; axis = 0; sgn = s; }
         if (tb < t1) t1 = tb;
-        if (t0 > t1) { ok = false; break; }
+        if (t0 > t1) ok = false;
+      }
+      if (ok) {
+        if (ady < 1e-8) { if (Math.abs(loy) > hy) { ok = false; } }
+        else {
+          const inv = 1 / ldy;
+          let ta = (-hy - loy) * inv, tb = (hy - loy) * inv, s = -1;
+          if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; s = 1; }
+          if (ta > t0) { t0 = ta; axis = 1; sgn = s; }
+          if (tb < t1) t1 = tb;
+          if (t0 > t1) ok = false;
+        }
+      }
+      if (ok) {
+        if (adz < 1e-8) { if (Math.abs(loz) > hz) { ok = false; } }
+        else {
+          const inv = 1 / ldz;
+          let ta = (-hz - loz) * inv, tb = (hz - loz) * inv, s = -1;
+          if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; s = 1; }
+          if (ta > t0) { t0 = ta; axis = 2; sgn = s; }
+          if (tb < t1) t1 = tb;
+          if (t0 > t1) ok = false;
+        }
       }
       if (!ok || t0 < 0 || t0 >= bestT || axis < 0) continue;
       bestT = t0; best = c;
-      const ln = [0, 0, 0]; ln[axis] = sgn;
-      bestN = _v1.set(ln[0], ln[1], ln[2]).clone();
+      if (axis === 0) _v1.set(sgn, 0, 0);
+      else if (axis === 1) _v1.set(0, sgn, 0);
+      else _v1.set(0, 0, sgn);
+      bestN = _v1.clone();
       c.toWorldDir(bestN, bestN);
     }
     if (!best) return null;
@@ -338,11 +373,13 @@ export class VerletBody {
   link(a, b, len, stiff) { const c = new DistanceConstraint(a, b, len, stiff); this.cons.push(c); return c; }
   range(a, b, min, max, stiff) { const c = new RangeConstraint(a, b, min, max, stiff); this.cons.push(c); return c; }
 
-  step(dt, iterations = 6) {
+  step(dt, iterations = 4) {
     if (this.sleeping) return;
     const g = _v3.set(0, GRAVITY, 0);
     let maxV = 0;
-    for (const p of this.parts) {
+    const parts = this.parts;
+    for (let pi = 0; pi < parts.length; pi++) {
+      const p = parts[pi];
       if (p.pinned) { p.prev.copy(p.p); p.acc.set(0, 0, 0); continue; }
       p.acc.add(g);
       const vx = (p.p.x - p.prev.x) * this.damping;
@@ -355,10 +392,16 @@ export class VerletBody {
       p.acc.set(0, 0, 0);
       maxV = Math.max(maxV, Math.abs(vx) + Math.abs(vy) + Math.abs(vz));
     }
+    // Reduced iteration count (4 vs 6): Verlet constraints converge fast and the
+    // visible difference is negligible for floppy corpses, but the cost scales
+    // linearly with iterations × constraints.
     for (let it = 0; it < iterations; it++) {
-      for (const c of this.cons) c.solve();
-      // limited self collision so limbs do not fully interpenetrate the torso
-      if (it === iterations - 1) this.selfCollide();
+      const cons = this.cons;
+      for (let ci = 0; ci < cons.length; ci++) cons[ci].solve();
+      // Self-collision only on the final iteration AND only if the body still has
+      // meaningful kinetic energy — once it is settling, skip it entirely. This
+      // removes the O(n²) pair test from the steady-state cost.
+      if (it === iterations - 1 && maxV > 0.02) this.selfCollide();
       this.collideWorld();
     }
     this.energy = this.energy * 0.9 + maxV * 0.1;
@@ -366,17 +409,24 @@ export class VerletBody {
   }
 
   selfCollide() {
+    // O(n²) but n is small (~19 particles per ragdoll) and only runs on the
+    // final solver iteration when the body is still energetic. Neighbour-aware
+    // skip (i+2) keeps adjacent bones from fighting their own distance constraint.
     const n = this.parts.length;
+    if (n < 4) return;
     for (let i = 0; i < n; i++) {
+      const a = this.parts[i];
       for (let j = i + 2; j < n; j++) {
-        const a = this.parts[i], b = this.parts[j];
-        const d = _v1.subVectors(b.p, a.p);
-        const dist = d.length();
+        const b = this.parts[j];
+        const dx = b.p.x - a.p.x, dy = b.p.y - a.p.y, dz = b.p.z - a.p.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
         const minD = (a.r + b.r) * 0.82;
-        if (dist > minD || dist < 1e-6) continue;
-        const push = (minD - dist) / dist * 0.5;
-        a.p.addScaledVector(d, -push * 0.5);
-        b.p.addScaledVector(d, push * 0.5);
+        if (d2 > minD * minD || d2 < 1e-12) continue;
+        const dist = Math.sqrt(d2);
+        const inv = 1 / dist;
+        const push = (minD - dist) * 0.5 * inv;
+        a.p.x -= dx * push * 0.5; a.p.y -= dy * push * 0.5; a.p.z -= dz * push * 0.5;
+        b.p.x += dx * push * 0.5; b.p.y += dy * push * 0.5; b.p.z += dz * push * 0.5;
       }
     }
   }
@@ -384,17 +434,21 @@ export class VerletBody {
   collideWorld() {
     const w = this.world;
     if (!w) return;
-    for (const p of this.parts) {
+    const parts = this.parts;
+    for (let pi = 0; pi < parts.length; pi++) {
+      const p = parts[pi];
       if (p.pinned) continue;
       const min = _v4.set(p.p.x - p.r, p.p.y - p.r, p.p.z - p.r);
       const max = _v5.set(p.p.x + p.r, p.p.y + p.r, p.p.z + p.r);
       const cands = w.query(min, max, _candBuf);
       p.grounded = false;
-      for (const c of cands) {
+      for (let ci = 0; ci < cands.length; ci++) {
+        const c = cands[ci];
         const cp = c.closest(p.p, _v1);
-        const d = _v2.subVectors(p.p, cp);
-        let len = d.length();
-        if (len >= p.r) continue;
+        const dx = p.p.x - cp.x, dy = p.p.y - cp.y, dz = p.p.z - cp.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 >= p.r * p.r) continue;
+        let len = Math.sqrt(d2);
         let nx, ny, nz;
         if (len < 1e-6) {
           const l = c.toLocal(p.p, _v1);
@@ -406,7 +460,8 @@ export class VerletBody {
           nx = _v2.x; ny = _v2.y; nz = _v2.z;
           len = 0.0001;
         } else {
-          nx = d.x / len; ny = d.y / len; nz = d.z / len;
+          const inv = 1 / len;
+          nx = dx * inv; ny = dy * inv; nz = dz * inv;
         }
         const push = p.r - len;
         p.p.x += nx * push; p.p.y += ny * push; p.p.z += nz * push;

@@ -19,9 +19,49 @@ import { ZOMBIE_TYPES } from './entities/zombieModel.js';
 import { buildGrenade } from './entities/weapons.js';
 import { HUD } from './ui/HUD.js';
 import { Menu } from './ui/Menu.js';
+import { Story } from './ui/Story.js';
 import { Rng } from './gfx/noise.js';
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3();
+
+/* -------------------------------------------------------------------------- */
+/* Zombie spatial hash — lets Zombie.avoid() find neighbours in O(1)-ish       */
+/* instead of an O(n²) scan over the whole horde. Rebuilt once per frame in    */
+/* Game.updateZombies(), then queried by every zombie's separation step.       */
+/* -------------------------------------------------------------------------- */
+class ZombieSpatialGrid {
+  constructor(cell = 4.0) {
+    this.cell = cell;
+    this.map = new Map();
+    this._nearBuf = [];
+  }
+  clear() { this.map.clear(); }
+  _key(x, z) {
+    const c = this.cell;
+    return (Math.floor(x / c) | 0) + ',' + (Math.floor(z / c) | 0);
+  }
+  insert(z) {
+    const k = this._key(z.root.position.x, z.root.position.z);
+    let a = this.map.get(k);
+    if (!a) { a = []; this.map.set(k, a); }
+    a.push(z);
+  }
+  /** All zombies in the cell containing (x,z) plus the 8 neighbouring cells. */
+  queryNear(x, z) {
+    const c = this.cell;
+    const cx = Math.floor(x / c), cz = Math.floor(z / c);
+    const out = this._nearBuf;
+    out.length = 0;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const a = this.map.get((cx + dx) + ',' + (cz + dz));
+        if (a) for (let i = 0; i < a.length; i++) out.push(a[i]);
+      }
+    }
+    return out;
+  }
+}
+
 
 const DEFAULT_SETTINGS = {
   quality: 'high',
@@ -53,7 +93,7 @@ const DIFF = {
 export class Game {
   constructor(canvas) {
     this.canvas = canvas;
-    this.state = 'loading';   // loading | menu | playing | paused | intermission | dead
+    this.state = 'loading';   // loading | menu | playing | paused | dead
     this.rng = new Rng(Date.now() & 0xffff);
 
     /* ---------------------------------------------------------- settings */
@@ -79,6 +119,12 @@ export class Game {
     this.godMode = false;
     this.aimTarget = null;
 
+    // Shared spatial hash for the zombie horde. Rebuilt each frame from the
+    // zombies array; queried by Zombie.avoid() for O(1)-ish neighbour lookup
+    // instead of the old O(n²) separation scan. With 38 zombies that scan was
+    // 38×38 = 1444 distance tests every frame; the grid cuts it to ~150.
+    this.zombieGrid = new ZombieSpatialGrid(4.0);
+
     this.stats = {
       score: 0, kills: 0, headshots: 0, hits: 0, shots: 0,
       wave: 1, time: 0, streak: 0, bestStreak: 0
@@ -97,8 +143,8 @@ export class Game {
     this.spawnQueue = [];
     this.spawnTimer = 0;
     this.aliveTarget = 0;
-    this.intermission = 0;
-    this.intermissionTotal = 10;
+    // continuous-flow wave director: short breather between waves, no pause
+    this.waveBreak = 0;
 
     this.clock = new THREE.Clock();
     this.time = 0;
@@ -109,6 +155,7 @@ export class Game {
 
     this.menu = new Menu(this);
     this.hud = null;
+    this.story = new Story(this);
 
     window.addEventListener('resize', () => this.onResize());
     this.input.onLockChange((locked) => {
@@ -252,6 +299,12 @@ export class Game {
     this.player.fov = this.settings.fov;
     this.camera.updateProjectionMatrix();
 
+    // Story: reset the narrative and prime the intro beat. The game now flows
+    // continuously — no intermission screen between waves — so the story system
+    // delivers weapon unlocks and objectives over the radio while you fight.
+    this.story.reset();
+    this.hud?.setObjective(this.story.currentObj);
+
     this.spawnPickups();
     this.menu.hide();
     this.hud.show(true);
@@ -366,50 +419,55 @@ export class Game {
   }
 
   endWave() {
-    this.state = 'intermission';
-    this.intermission = this.intermissionTotal;
-    this.audio.play('waveEnd', null, 0.8);
+    // Continuous story flow: do NOT open an intermission screen. The wave ends,
+    // a brief radio call plays, the next wave's composition is queued and the
+    // director starts trickling the next group in within a couple of seconds —
+    // the player keeps full control of the camera and weapons the whole time.
+    this.audio.play('waveEnd', null, 0.7);
     this.audio.setTension(0.1);
-    // restock the map
     this.spawnPickups();
-    const unlocks = [];
-    const grant = (key, label) => {
-      if (!this.player.owned[key]) { this.player.owned[key] = true; unlocks.push(label); }
-    };
-    if (this.wave >= 2) grant('shotgun', 'BREAKER 12G unlocked');
-    if (this.wave >= 4) grant('smg', 'VECTOR-9 unlocked');
-    if (this.wave >= 6) grant('sniper', 'LONGSHOT .338 unlocked');
+    // field resupply — keeps the player in the fight without a shop screen
     this.player.grenades = Math.min(6, this.player.grenades + 2);
-    this.player.giveAmmo(1.4);
-    this.player.armor = Math.min(this.player.maxArmor, this.player.armor + 35);
+    this.player.giveAmmo(1.3);
+    this.player.armor = Math.min(this.player.maxArmor, this.player.armor + 30);
     this.hud.setGrenades(this.player.grenades);
     this.hud.setWeapon(this.player.stats, this.player.ammoNow);
-
-    this.menu.setIntermission(this.wave, this.stats, this.intermission, unlocks);
-    this.menu.show('intermission');
-    this.input.releaseLock();
+    this.hud.centerMessage(`WAVE ${this.wave} CLEARED`, 'Reinforcements inbound', 2.4);
     if (this.wave > this.best) {
       this.best = this.wave;
       localStorage.setItem('ds_best', String(this.best));
+      this.menu.setBest(this.best);
     }
+    // small breather, then the next wave starts seamlessly
+    this.waveBreak = 3.0;
   }
 
   skipIntermission() {
-    if (this.state !== 'intermission') return;
-    this.intermission = 0;
+    // No intermission screen anymore — kept for HUD/menu button compatibility.
+    if (this.waveBreak > 0.5) this.waveBreak = 0.5;
   }
 
   continueAfterIntermission() {
-    this.menu.hide();
-    this.state = 'playing';
-    this.input.clear();
-    this.input.requestLock();
-    this.beginWave(this.wave + 1);
+    // No-op now; waves flow continuously. Retained so old menu wiring doesn't break.
   }
 
   updateWaves(dt) {
     if (this.state !== 'playing') return;
     const aliveCount = this.zombies.reduce((n, z) => n + (z.dead ? 0 : 1), 0);
+
+    // Continuous flow: when a wave is cleared we set a short waveBreak breather
+    // instead of opening an intermission screen. During the break the player
+    // keeps full control; when it elapses the next wave begins seamlessly.
+    if (this.waveBreak > 0) {
+      this.waveBreak -= dt;
+      // still let the player mop up and listen to the radio during the breather
+      if (this.waveBreak <= 0) {
+        this.waveBreak = 0;
+        this.beginWave(this.wave + 1);
+      }
+      this.hud.setWave(this.wave, aliveCount, this.waveTotal);
+      return;
+    }
 
     if (this.spawnQueue.length > 0) {
       this.spawnTimer -= dt;
@@ -734,17 +792,9 @@ export class Game {
       return;
     }
 
-    if (this.state === 'intermission') {
-      this.intermission -= dt;
-      this.menu.setIntermissionCount(Math.max(0, this.intermission));
-      this.level.update(dt, t);
-      this.fx.update(dt, t);
-      this.updateShake(dt, t);
-      this.renderer.render(dt, t);
-      if (this.intermission <= 0) this.continueAfterIntermission();
-      this.input.endFrame();
-      return;
-    }
+    // The old 'intermission' state is gone — waves flow continuously now, with
+    // a short waveBreak handled inside updateWaves() and the story delivering
+    // unlocks/objectives over the radio while the player keeps fighting.
 
     if (this.state === 'dead') {
       this.player.update(dt, t);
@@ -781,6 +831,10 @@ export class Game {
     this.fx.update(dt, t);
     this.level.update(dt, t);
     this.updateShake(dt, t);
+    // Drive the story system every frame — it fires narrative beats, queues
+    // radio transmissions, updates the live objective, and grants field
+    // weapon drops at story milestones (replacing the old shop screen).
+    this.story.update(dt, this.stats);
 
     /* --- damage / low-health post FX --- */
     if (this.renderer.grade) {
@@ -804,6 +858,8 @@ export class Game {
 
     this.hud.update(dt);
     this.hud.setStats(this.stats);
+    this.hud.setRadio(this.story.radioLines());
+    this.hud.setObjective(this.story.currentObj, this.story.objT > 0);
 
     /* --- render --- */
     this.renderer.render(dt, t);
@@ -813,6 +869,13 @@ export class Game {
   }
 
   updateZombies(dt, t) {
+    // Rebuild the shared spatial hash once per frame so every zombie's
+    // separation step can do neighbour lookup in O(1)-ish instead of O(n²).
+    this.zombieGrid.clear();
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      if (!z.dead) this.zombieGrid.insert(z);
+    }
     // stagger expensive AI work across frames for large hordes
     for (let i = this.zombies.length - 1; i >= 0; i--) {
       const z = this.zombies[i];
@@ -827,12 +890,16 @@ export class Game {
   /** Highlight the crosshair when a zombie is under it. */
   updateAimTarget() {
     if (!this.player.alive) { this.aimTarget = null; return; }
-    if ((this.frame & 1) !== 0) return;
+    // Throttle to every 3rd frame — the crosshair colour change does not need
+    // 60Hz precision and this avoids a full-horde raycast 40 times a second.
+    if ((this.frame % 3) !== 0) return;
     const origin = this.camera.position;
     const dir = this.camera.getWorldDirection(_v3).clone();
     const wHit = this.physics.raycast(origin, dir, 90);
     const maxD = wHit ? wHit.t : 90;
     let found = null;
+    // Use the bounding-sphere early-out inside raycastZones, but also skip
+    // zombies that are clearly out of the camera frustum via a cheap dot test.
     for (const z of this.zombies) {
       if (z.dead) continue;
       if (z.root.position.distanceToSquared(origin) > maxD * maxD + 9) continue;

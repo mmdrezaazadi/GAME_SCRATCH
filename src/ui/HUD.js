@@ -67,6 +67,11 @@ export class HUD {
       <div class="hud-toasts" id="toasts"></div>
       <div class="hud-center-msg" id="center-msg"></div>
       <div class="hud-prompt" id="use-prompt"></div>
+      <div class="hud-objective" id="hud-objective">
+        <span class="obj-label">OBJECTIVE</span>
+        <span class="obj-text" id="obj-text">Survive the outbreak</span>
+      </div>
+      <div class="hud-radio" id="hud-radio"></div>
       <div class="hud-hint" id="hud-hint">
         <b>WASD</b> move · <b>MOUSE</b> aim · <b>LMB</b> fire · <b>RMB</b> aim · <b>R</b> reload
         · <b>1-5</b> weapons · <b>SHIFT</b> sprint · <b>CTRL</b> crouch · <b>SPACE</b> jump
@@ -85,6 +90,8 @@ export class HUD {
       waveNum: $('wave-num'), waveSub: $('wave-sub'), waveBar: $('wave-bar'),
       scoreV: $('score-v'), killsV: $('kills-v'), hsV: $('hs-v'), accV: $('acc-v'),
       toasts: $('toasts'), centerMsg: $('center-msg'), usePrompt: $('use-prompt'),
+      objective: $('hud-objective'), objText: $('obj-text'),
+      radio: $('hud-radio'),
       hint: $('hud-hint'), lowhp: $('lowhp'), killfeed: $('killfeed')
     };
 
@@ -152,6 +159,38 @@ export class HUD {
   }
 
   setScope(v) { this.scope = v; }
+
+  /** Render the live radio transmission queue as a subtitle strip. */
+  setRadio(lines) {
+    if (!this.el.radio) return;
+    if (!lines || !lines.length) { this.el.radio.innerHTML = ''; return; }
+    // Render the most recent line prominently and any queued line dimmed.
+    const html = lines.map((q, i) => {
+      const last = i === lines.length - 1;
+      // fade out near the end of life
+      const fade = q.t > q.life - 1.2 ? Math.max(0, (q.life - q.t) / 1.2) : 1;
+      const cls = q.kind === 'warn' ? 'radio-warn' : q.kind === 'drop' ? 'radio-drop' : 'radio-cmd';
+      return `<div class="radio-line ${cls} ${last ? 'radio-active' : 'radio-queued'}" style="opacity:${last ? fade.toFixed(2) : (fade * 0.4).toFixed(2)}">
+        <span class="radio-src">${q.kind === 'warn' ? '⚠ COMMAND' : q.kind === 'drop' ? '◈ SUPPLY' : '◈ COMMAND'}</span>
+        <span class="radio-text">${q.text}</span>
+      </div>`;
+    }).join('');
+    this.el.radio.innerHTML = html;
+  }
+
+  /** Set the persistent objective line; flash when freshly updated. */
+  setObjective(text, flash = false) {
+    if (!this.el.objText) return;
+    if (this._objText === text && !flash) return;
+    this._objText = text;
+    this.el.objText.textContent = text;
+    if (flash) {
+      this.el.objective.classList.remove('flash');
+      // restart the CSS animation
+      void this.el.objective.offsetWidth;
+      this.el.objective.classList.add('flash');
+    }
+  }
 
   showHitmarker(isHead) {
     this.hitmarkers.push({ t: 0, life: isHead ? 0.34 : 0.22, head: !!isHead });
