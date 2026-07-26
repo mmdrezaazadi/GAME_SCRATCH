@@ -429,44 +429,80 @@ async function stageApp(appDir) {
 /* ========================================================================= */
 /*                              SFX RESOLUTION                               */
 /* ========================================================================= */
+/* A Windows PE SFX module is a real Windows executable that, when prepended
+ * to a 7z payload (+ an ;!@Install@! config block), yields a one-click
+ * portable .exe. We ship the official 7-Zip GUI SFX module in assets/ so the
+ * packager is fully self-contained — no runtime download of SFX modules.
+ * We pick a module by verifying it starts with "MZ" (PE), which cleanly
+ * distinguishes the Windows 7z.sfx from the Linux ELF 7zCon.sfx in /usr/lib.
+ */
+function isWindowsPE(p) {
+  try {
+    const fd = fs.openSync(p, 'r');
+    const head = Buffer.alloc(2);
+    fs.readSync(fd, head, 0, 2, 0);
+    fs.closeSync(fd);
+    return head.toString('ascii') === 'MZ';
+  } catch (e) { return false; }
+}
+
 async function resolveSfx() {
-  // Prefer 7zSD.sfx / 7zS2.sfx — they support RunProgram (one-click launch).
-  const local = [
+  // 1. Bundled, self-contained Windows SFX modules (preferred).
+  const bundled = [
+    path.join(root, 'assets', '7z.sfx'),      // official 7-Zip GUI SFX (RunProgram)
     path.join(root, 'assets', '7zSD.sfx'),
-    '/usr/lib/p7zip/7zCon.sfx',
-    '/usr/lib/p7zip/7z.sfx',
-    '/usr/share/p7zip/7z.sfx',
-    '/usr/libexec/p7zip/7z.sfx',
-    '/usr/lib/7zip/7zCon.sfx',
-    '/usr/lib/7zip/7z.sfx'
-  ].find((p) => fs.existsSync(p));
-
-  if (local && /7zSD|7zS2/.test(path.basename(local))) {
-    log('using SFX module', local);
-    return local;
-  }
-
-  // Try to fetch the official extras package which contains 7zSD.sfx.
-  for (const rel of ['7z2408-extra.7z', '7z2301-extra.7z', '7z1900-extra.7z']) {
-    try {
-      const dl = path.join(CACHE, rel);
-      if (!fs.existsSync(dl)) {
-        log('fetching 7-Zip SFX modules:', rel);
-        await download('https://www.7-zip.org/a/' + rel, dl);
-      }
-      const dir = path.join(WORK, 'sfx');
-      fs.mkdirSync(dir, { recursive: true });
-      execFileSync('7z', ['x', '-y', `-o${dir}`, dl], { stdio: ['ignore', 'ignore', 'inherit'] });
-      const found = ['7zSD.sfx', '7zS2.sfx', '7zS2con.sfx', '7z.sfx']
-        .map((n) => path.join(dir, n))
-        .find((p) => fs.existsSync(p));
-      if (found) { log('using SFX module', path.basename(found)); return found; }
-    } catch (e) {
-      log('SFX fetch failed for', rel, '—', e.message);
+    path.join(root, 'assets', '7zS2.sfx'),
+    path.join(root, 'assets', '7zCon.sfx')    // console SFX, still a Windows PE
+  ];
+  for (const p of bundled) {
+    if (fs.existsSync(p) && isWindowsPE(p)) {
+      log('using bundled SFX module', path.basename(p), '(Windows PE)');
+      return p;
     }
   }
 
-  if (local) { log('falling back to console SFX module', local); return local; }
+  // 2. System SFX modules — only usable if they are Windows PEs (the Linux
+  //    ELF 7zCon.sfx in /usr/lib/7zip cannot produce a Windows .exe).
+  const system = [
+    '/usr/lib/p7zip/7z.sfx',
+    '/usr/share/p7zip/7z.sfx',
+    '/usr/libexec/p7zip/7z.sfx',
+    '/usr/lib/7zip/7z.sfx',
+    '/usr/lib/p7zip/7zCon.sfx',
+    '/usr/lib/7zip/7zCon.sfx'
+  ];
+  for (const p of system) {
+    if (fs.existsSync(p) && isWindowsPE(p)) {
+      log('using system SFX module', p, '(Windows PE)');
+      return p;
+    }
+  }
+
+  // 3. Last-resort: fetch the official 7-Zip Windows installer and extract its
+  //    7z.sfx. This is a build-time-only download; the final exe is portable.
+  for (const ver of ['2407', '2408', '2301', '2201']) {
+    try {
+      const inst = path.join(CACHE, `7z${ver}-x64.exe`);
+      if (!fs.existsSync(inst) || fs.statSync(inst).size < 500000) {
+        log('fetching 7-Zip installer for SFX module:', ver);
+        await download(`https://www.7-zip.org/a/7z${ver}-x64.exe`, inst);
+      }
+      const dir = path.join(WORK, 'sfx');
+      fs.mkdirSync(dir, { recursive: true });
+      execFileSync('7z', ['x', '-y', `-o${dir}`, inst], { stdio: ['ignore', 'ignore', 'inherit'] });
+      const found = ['7z.sfx', '7zSD.sfx', '7zS2.sfx', '7zCon.sfx']
+        .map((n) => path.join(dir, n))
+        .find((p) => fs.existsSync(p) && isWindowsPE(p));
+      if (found) {
+        // cache it into assets/ so future builds are download-free
+        fs.copyFileSync(found, path.join(root, 'assets', path.basename(found)));
+        log('using extracted SFX module', path.basename(found), '(cached to assets/)');
+        return found;
+      }
+    } catch (e) {
+      log('SFX fetch failed for', ver, '—', e.message);
+    }
+  }
   return null;
 }
 
@@ -543,7 +579,12 @@ async function main() {
 
   const sfx = await resolveSfx();
   if (!sfx) throw new Error('no 7-Zip SFX module available');
-  const modern = /7zSD|7zS2/.test(path.basename(sfx));
+  // The official 7-Zip GUI SFX modules (7z.sfx, 7zSD.sfx, 7zS2.sfx) all read an
+  // ;!@Install@!UTF-8! config block that can carry RunProgram — turning the
+  // SFX into a true one-click portable launcher. 7zCon.sfx is console-only and
+  // cannot auto-run, so it just extracts to a folder.
+  const sfxName = path.basename(sfx);
+  const modern = /7zSD|7zS2|^7z\.sfx$/.test(sfxName);
 
   const parts = [fs.readFileSync(sfx)];
   if (modern) {

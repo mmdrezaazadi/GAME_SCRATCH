@@ -6,8 +6,9 @@ node_modules/
 build/*
 !build/.gitkeep
 
-# generated bundle (rebuild with `npm run build:bundle`)
-public/bundle.js
+# generated bundle is COMMITTED so the game works offline via file://
+# (rebuilt with `npm run build:bundle` — three.js + all game code, self-contained)
+# sourcemaps are dev-only and stay ignored
 public/bundle.js.map
 
 # staged asset copy (public/assets is a symlink in dev, a real copy at package
