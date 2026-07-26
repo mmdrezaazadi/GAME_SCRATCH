@@ -1,0 +1,32 @@
+{
+  "name": "dead-sector",
+  "productName": "Dead Sector",
+  "version": "1.0.0",
+  "description": "Dead Sector — a detailed 3D zombie shooter built from scratch (procedural PBR models, ragdoll physics, gore FX).",
+  "main": "electron/main.cjs",
+  "author": {
+    "name": "mmdrezaazadi",
+    "email": "mmdrezaazadi@users.noreply.github.com"
+  },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build:bundle": "node tools/build.mjs",
+    "watch": "node tools/build.mjs --watch",
+    "start": "npm run build:bundle && electron .",
+    "serve": "npm run build:bundle && node tools/serve.mjs",
+    "pack:win": "node tools/package-win.mjs",
+    "build:exe": "npm run build:bundle && node tools/package-win.mjs"
+  },
+  "dependencies": {
+    "three": "0.169.0"
+  },
+  "devDependencies": {
+    "electron": "32.2.0",
+    "esbuild": "0.24.0"
+  },
+  "build": {
+    "appId": "io.github.mmdrezaazadi.deadsector",
+    "productName": "DeadSector"
+  }
+}
